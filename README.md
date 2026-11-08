@@ -14,6 +14,20 @@ La primera ejecución crea una base SQLite en `~/.finanzas_personales/finanzas.s
 2. Configura `SUPABASE_URL` y `SUPABASE_KEY` en el entorno donde ejecutas la app.
 3. Inicia la aplicación. Los cambios se guardan localmente y se envían a Supabase cuando la conexión está disponible.
 
+La aplicación carga automáticamente el archivo `.env` del proyecto si existe. La sincronización fusiona los datos locales y remotos: también sube a Supabase las cuentas, tarjetas, categorías y movimientos que todavía no estén allí.
+
+## Migrar los estados existentes
+
+Para cargar los archivos históricos de BAC y G&T, ejecuta una sola vez:
+
+```bash
+uv run python scripts/migrate_existing_data.py "/ruta/Analisis financiero - personal"
+```
+
+El comando crea las cuentas `Cuenta BAC`, `Tarjeta BAC` y `Cuenta G&T`, importa todos los movimientos sin duplicarlos y los sincroniza con Supabase cuando las credenciales están configuradas. Se puede repetir con seguridad; los movimientos ya existentes se cuentan como omitidos.
+
+Desde la sección **Cuentas y tarjetas** también se pueden crear múltiples cuentas o tarjetas nuevas, cada una con un nombre visible diferente, banco y tipo.
+
 La app acepta CSV de cuentas/tarjetas BAC y archivos TXT tabulados de G&T. Los archivos se importan de forma idempotente usando un hash de fecha, descripción, cuenta y monto.
 
 ## Pruebas

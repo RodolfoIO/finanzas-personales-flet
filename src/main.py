@@ -9,7 +9,7 @@ from store import DataStore
 
 BG = "#F7F8FC"
 INK = "#172033"
-MUTED = "#6B7280"
+MUTED = "#475467"
 PRIMARY = "#5B55D9"
 GREEN = "#18A66B"
 RED = "#E45757"
@@ -36,9 +36,8 @@ def main(page: ft.Page):
     current_month = date.today().strftime("%Y-%m")
     selected_section = {"value": "dashboard"}
     content = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, spacing=20)
-    month_picker = ft.Dropdown(width=160, label="Periodo", value=current_month, options=[])
+    month_picker = ft.Dropdown(width=160, label="Periodo", value=current_month, options=[], color=INK, text_style=ft.TextStyle(color=INK), label_style=ft.TextStyle(color=MUTED), hint_style=ft.TextStyle(color=MUTED))
     file_picker = ft.FilePicker()
-    page.overlay.append(file_picker)
 
     page.title = "Pulso financiero"
     page.bgcolor = BG
@@ -90,25 +89,44 @@ def main(page: ft.Page):
         amount_color = RED if row["amount"] > 0 else GREEN
         sign = "-" if row["amount"] > 0 else "+"
         category_name = row.get("category_name") or "Sin clasificar"
+        subcategory_name = row.get("subcategory_name")
+        classification = f"{category_name} · {subcategory_name}" if subcategory_name else category_name
         if compact:
-            return ft.Container(ft.Row([ft.Container(width=10, height=10, bgcolor=row.get("category_color") or MUTED, border_radius=10), ft.Column([ft.Text(row["description"][:45], color=INK, weight=ft.FontWeight.W_500), ft.Text(f"{row['transaction_date']} · {row['account_name']} · {category_name}", size=11, color=MUTED)], expand=True), ft.Text(f"{sign}{money(abs(row['amount']))}", color=amount_color, weight=ft.FontWeight.BOLD)], spacing=10), padding=ft.Padding.symmetric(vertical=8))
+            return ft.Container(ft.Row([ft.Container(width=10, height=10, bgcolor=row.get("category_color") or MUTED, border_radius=10), ft.Column([ft.Text(row["description"][:45], color=INK, weight=ft.FontWeight.W_500), ft.Text(f"{row['transaction_date']} · {row['account_name']} · {classification}", size=11, color=MUTED)], expand=True), ft.Text(f"{sign}{money(abs(row['amount']))}", color=amount_color, weight=ft.FontWeight.BOLD)], spacing=10), padding=ft.Padding.symmetric(vertical=8))
         options = [ft.DropdownOption(key="", text="Sin clasificar")] + [ft.DropdownOption(key=c["id"], text=c["name"]) for c in store.categories()]
-        dropdown = ft.Dropdown(value=row["category_id"] or "", options=options, width=165, dense=True, on_select=lambda e: (store.update_transaction_category(row["id"], e.control.value or None), render()))
-        return ft.DataRow(cells=[ft.DataCell(ft.Text(row["transaction_date"], size=12)), ft.DataCell(ft.Column([ft.Text(row["description"][:48], color=INK), ft.Text(row["account_name"], color=MUTED, size=11)])), ft.DataCell(dropdown), ft.DataCell(ft.Text(f"{sign}{money(abs(row['amount']))}", color=amount_color, weight=ft.FontWeight.BOLD))])
+        category_dropdown = ft.Dropdown(value=row["category_id"] or "", options=options, width=155, dense=True, color=INK, text_style=ft.TextStyle(color=INK), label_style=ft.TextStyle(color=MUTED))
+        subcategory_options = [ft.DropdownOption(key="", text="Sin subcategoría")] + [ft.DropdownOption(key=s["id"], text=s["name"]) for s in store.subcategories(row["category_id"])] if row.get("category_id") else [ft.DropdownOption(key="", text="Selecciona categoría")]
+        subcategory_dropdown = ft.Dropdown(value=row.get("subcategory_id") or "", options=subcategory_options, width=165, dense=True, color=INK, text_style=ft.TextStyle(color=INK), label_style=ft.TextStyle(color=MUTED), disabled=not row.get("category_id"))
+
+        def change_category(e):
+            category_id = e.control.value or None
+            store.update_transaction_classification(row["id"], category_id, None)
+            render()
+
+        def change_subcategory(e):
+            store.update_transaction_classification(row["id"], row.get("category_id"), e.control.value or None)
+            render()
+
+        category_dropdown.on_select = change_category
+        subcategory_dropdown.on_select = change_subcategory
+        return ft.DataRow(cells=[ft.DataCell(ft.Text(row["transaction_date"], size=12, color=MUTED)), ft.DataCell(ft.Column([ft.Text(row["description"][:48], color=INK), ft.Text(row["account_name"], color=MUTED, size=11)])), ft.DataCell(category_dropdown), ft.DataCell(subcategory_dropdown), ft.DataCell(ft.Text(f"{sign}{money(abs(row['amount']))}", color=amount_color, weight=ft.FontWeight.BOLD))])
 
     def transactions_page():
         month = month_picker.value or current_month
         rows = store.transactions(month)
-        search = ft.TextField(label="Buscar movimiento", prefix_icon=ft.Icons.SEARCH, expand=True)
-        table = ft.DataTable(columns=[ft.DataColumn(ft.Text("Fecha")), ft.DataColumn(ft.Text("Descripción")), ft.DataColumn(ft.Text("Categoría")), ft.DataColumn(ft.Text("Monto"))], rows=[], heading_row_color="#F5F6FA")
+        search = ft.TextField(label="Buscar movimiento", prefix_icon=ft.Icons.SEARCH, expand=True, color=INK, text_style=ft.TextStyle(color=INK), label_style=ft.TextStyle(color=MUTED), hint_style=ft.TextStyle(color=MUTED))
+        table = ft.DataTable(columns=[ft.DataColumn(ft.Text("Fecha", color=INK, weight=ft.FontWeight.BOLD)), ft.DataColumn(ft.Text("Descripción", color=INK, weight=ft.FontWeight.BOLD)), ft.DataColumn(ft.Text("Categoría", color=INK, weight=ft.FontWeight.BOLD)), ft.DataColumn(ft.Text("Subcategoría", color=INK, weight=ft.FontWeight.BOLD)), ft.DataColumn(ft.Text("Monto", color=INK, weight=ft.FontWeight.BOLD))], rows=[], heading_row_color="#F5F6FA", data_text_style=ft.TextStyle(color=INK), heading_text_style=ft.TextStyle(color=INK, weight=ft.FontWeight.BOLD))
 
-        def filter_rows(_=None):
+        def filter_rows(_, update=True):
             term = (search.value or "").lower()
-            table.rows = [transaction_row(row) for row in rows if term in row["description"].lower() or term in (row.get("category_name") or "").lower()]
-            table.update()
+            table.rows = [transaction_row(row) for row in rows if term in row["description"].lower() or term in (row.get("category_name") or "").lower() or term in (row.get("subcategory_name") or "").lower()]
+            if update:
+                # Actualiza el árbol de la página, no la tabla directamente.
+                # La vista puede haber sido reemplazada al navegar a otra sección.
+                page.update()
 
         search.on_change = filter_rows
-        filter_rows()
+        filter_rows(None, update=False)
         return [header("Movimientos", "Clasifica, revisa e importa los consumos de tus cuentas y tarjetas."), ft.Row([search, ft.FilledButton("Importar archivo", icon=ft.Icons.UPLOAD_FILE, on_click=lambda _: open_import_dialog()), ft.FilledButton("Nuevo movimiento", icon=ft.Icons.ADD, on_click=lambda _: open_transaction_dialog())], spacing=10), card(ft.Column([ft.Row([ft.Text(f"{len(rows)} movimientos en {month_label(month)}", weight=ft.FontWeight.BOLD, color=INK), ft.Text("Los cambios se guardan automáticamente", color=MUTED, size=12)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), ft.Row([table], scroll=ft.ScrollMode.AUTO)], spacing=15))]
 
     def budgets_page():
@@ -116,7 +134,7 @@ def main(page: ft.Page):
         summary = store.summary(month)
         controls = []
         for category in store.categories():
-            budget = ft.TextField(value=str(category["monthly_budget"]), prefix_text="Q ", width=140, keyboard_type=ft.KeyboardType.NUMBER)
+            budget = ft.TextField(value=str(category["monthly_budget"]), prefix="Q ", width=140, keyboard_type=ft.KeyboardType.NUMBER)
             spent = summary["by_category"].get(category["name"], 0)
 
             def save(e, category_id=category["id"], field=budget):
@@ -137,12 +155,13 @@ def main(page: ft.Page):
             total = sum(row["amount"] for row in all_transactions if row["account_id"] == account["id"])
             account_cards.append(card(ft.Column([ft.Row([ft.Icon(ft.Icons.CREDIT_CARD if account["account_type"] == "tarjeta" else ft.Icons.ACCOUNT_BALANCE, color=PRIMARY), ft.Text(account["name"], size=17, weight=ft.FontWeight.BOLD, color=INK, expand=True)]), ft.Text(account["institution"] or "Institución no definida", color=MUTED), ft.Text(money(total), size=24, weight=ft.FontWeight.BOLD, color=INK), ft.Text(f"{account['account_type'].capitalize()} · {account['currency']}", color=MUTED, size=12)], spacing=9), width=300))
         status_color = GREEN if store.remote.enabled else MUTED
-        return [header("Cuentas y tarjetas", "Conecta tus fuentes financieras y consolida todo en un solo lugar."), ft.Row([ft.FilledButton("Agregar cuenta", icon=ft.Icons.ADD, on_click=lambda _: open_account_dialog()), ft.Container(expand=True), ft.Container(content=ft.Row([ft.Icon(ft.Icons.CLOUD_DONE, color=status_color), ft.Text(store.backend_label, color=MUTED, size=12)]), padding=10, bgcolor="#ECFDF5" if store.remote.enabled else "#F1F3F6", border_radius=10)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), ft.Row(account_cards, wrap=True, spacing=14) if account_cards else ft.Text("Agrega tu primera cuenta para comenzar.", color=MUTED)]
+        return [header("Cuentas y tarjetas", "Agrega todas tus cuentas y tarjetas con el nombre que quieras."), ft.Row([ft.Row([ft.FilledButton("Nueva cuenta", icon=ft.Icons.ACCOUNT_BALANCE_OUTLINED, on_click=lambda _: open_account_dialog("cuenta")), ft.FilledButton("Nueva tarjeta", icon=ft.Icons.CREDIT_CARD, on_click=lambda _: open_account_dialog("tarjeta"))], spacing=10), ft.Container(expand=True), ft.Container(content=ft.Row([ft.Icon(ft.Icons.CLOUD_DONE, color=status_color), ft.Text(store.backend_label, color=MUTED, size=12)]), padding=10, bgcolor="#ECFDF5" if store.remote.enabled else "#F1F3F6", border_radius=10)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), ft.Row(account_cards, wrap=True, spacing=14) if account_cards else ft.Text("Agrega tu primera cuenta o tarjeta para comenzar.", color=MUTED)]
 
-    def open_account_dialog():
-        name = ft.TextField(label="Nombre visible", hint_text="Tarjeta BAC Platinum")
+    def open_account_dialog(default_type: str = "cuenta"):
+        is_card = default_type == "tarjeta"
+        name = ft.TextField(label="Nombre visible", hint_text="Tarjeta BAC Platinum" if is_card else "Cuenta BAC principal")
         institution = ft.TextField(label="Banco o institución", hint_text="BAC, G&T...")
-        kind = ft.Dropdown(label="Tipo", value="cuenta", options=[ft.DropdownOption(key="cuenta", text="Cuenta bancaria"), ft.DropdownOption(key="tarjeta", text="Tarjeta de crédito")])
+        kind = ft.Dropdown(label="Tipo", value=default_type, options=[ft.DropdownOption(key="cuenta", text="Cuenta bancaria"), ft.DropdownOption(key="tarjeta", text="Tarjeta de crédito")])
 
         def close_dialog():
             dialog.open = False
@@ -153,16 +172,21 @@ def main(page: ft.Page):
                 name.error_text = "Requerido"
                 name.update()
                 return
-            store.add_account(name.value, institution.value or "", kind.value or "cuenta")
+            try:
+                store.add_account(name.value, institution.value or "", kind.value or "cuenta")
+            except ValueError as error:
+                name.error_text = str(error)
+                name.update()
+                return
             close_dialog()
             render()
 
-        dialog = ft.AlertDialog(modal=True, title=ft.Text("Agregar cuenta"), content=ft.Column([name, institution, kind], tight=True, spacing=12), actions=[ft.TextButton("Cancelar", on_click=lambda _: close_dialog()), ft.FilledButton("Guardar", on_click=save)])
+        dialog = ft.AlertDialog(modal=True, title=ft.Text("Agregar cuenta o tarjeta"), content=ft.Column([name, institution, kind], tight=True, spacing=12), actions=[ft.TextButton("Cancelar", on_click=lambda _: close_dialog()), ft.FilledButton("Guardar", on_click=save)])
         page.show_dialog(dialog)
 
     def open_transaction_dialog():
         description = ft.TextField(label="Descripción", autofocus=True)
-        amount = ft.TextField(label="Monto", prefix_text="Q ", keyboard_type=ft.KeyboardType.NUMBER)
+        amount = ft.TextField(label="Monto", prefix="Q ", keyboard_type=ft.KeyboardType.NUMBER)
         account = ft.Dropdown(label="Cuenta o tarjeta", options=[ft.DropdownOption(key=a["id"], text=a["name"]) for a in store.accounts()])
         kind = ft.Dropdown(label="Tipo", value="expense", options=[ft.DropdownOption(key="expense", text="Gasto"), ft.DropdownOption(key="income", text="Ingreso")])
 
