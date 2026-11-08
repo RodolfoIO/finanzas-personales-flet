@@ -99,7 +99,9 @@ def _parse_gt(path: Path, account_id: str, store: Any) -> list[dict[str, Any]]:
 
 
 def _row(account_id: str, transaction_date: str, description: str, amount: float, source: str, store: Any) -> dict[str, Any]:
-    return {"account_id": account_id, "category_id": store.guess_category_id(description) if amount > 0 else None, "transaction_date": transaction_date, "description": re.sub(r"\s+", " ", description).strip(), "amount": amount, "transaction_type": "expense" if amount > 0 else "income", "source": source, "source_hash": _hash(account_id, transaction_date, description, amount)}
+    clean_description = re.sub(r"\s+", " ", description).strip()
+    suggestion = store.suggest_classification(clean_description) if hasattr(store, "suggest_classification") else None
+    return {"account_id": account_id, "category_id": suggestion["category_id"] if suggestion else (store.guess_category_id(clean_description) if amount > 0 else None), "subcategory_id": suggestion["subcategory_id"] if suggestion else None, "transaction_date": transaction_date, "description": clean_description, "amount": amount, "transaction_type": "expense" if amount > 0 else "income", "source": source, "source_hash": _hash(account_id, transaction_date, description, amount)}
 
 
 def import_file(path: str | Path, account_id: str, store: Any) -> tuple[int, int]:

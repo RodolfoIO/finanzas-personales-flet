@@ -16,6 +16,12 @@ La primera ejecución crea una base SQLite en `~/.finanzas_personales/finanzas.s
 
 La aplicación carga automáticamente el archivo `.env` del proyecto si existe. La sincronización fusiona los datos locales y remotos: también sube a Supabase las cuentas, tarjetas, categorías y movimientos que todavía no estén allí.
 
+El `.env` debe estar en la raíz del proyecto, junto a `pyproject.toml`, con `SUPABASE_URL` y `SUPABASE_KEY` reales. La app lo busca tanto en la carpeta desde donde se inicia como en la raíz del proyecto.
+
+Las categorías ahora admiten múltiples subcategorías. Ejecuta nuevamente [`supabase/schema.sql`](supabase/schema.sql) en el SQL Editor remoto para crear `subcategories` y agregar `subcategory_id` a los movimientos existentes. El script es repetible y conserva los datos actuales.
+
+Si las tablas principales ya estaban creadas, también puedes ejecutar directamente [`supabase/subcategories_migration.sql`](supabase/subcategories_migration.sql).
+
 ## Migrar los estados existentes
 
 Para cargar los archivos históricos de BAC y G&T, ejecuta una sola vez:
@@ -27,6 +33,10 @@ uv run python scripts/migrate_existing_data.py "/ruta/Analisis financiero - pers
 El comando crea las cuentas `Cuenta BAC`, `Tarjeta BAC` y `Cuenta G&T`, importa todos los movimientos sin duplicarlos y los sincroniza con Supabase cuando las credenciales están configuradas. Se puede repetir con seguridad; los movimientos ya existentes se cuentan como omitidos.
 
 Desde la sección **Cuentas y tarjetas** también se pueden crear múltiples cuentas o tarjetas nuevas, cada una con un nombre visible diferente, banco y tipo.
+
+La sección **Categorías** permite crear y renombrar categorías, agregar o renombrar subcategorías y eliminar subcategorías. En los movimientos se puede seleccionar primero la categoría y luego una subcategoría perteneciente a ella.
+
+Cuando una descripción se repite, la app recuerda la clasificación anterior y reutiliza categoría y subcategoría al importar o crear el movimiento. La comparación ignora mayúsculas, acentos y números variables.
 
 La app acepta CSV de cuentas/tarjetas BAC y archivos TXT tabulados de G&T. Los archivos se importan de forma idempotente usando un hash de fecha, descripción, cuenta y monto.
 

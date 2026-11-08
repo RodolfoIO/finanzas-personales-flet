@@ -63,3 +63,62 @@ def test_existing_files_migrate_idempotently(tmp_path: Path):
     assert len(store.transactions()) == 1
     assert store.find_account("Cuenta BAC", "BAC", "cuenta") is not None
     store.close()
+
+
+def test_subcategories_belong_to_categories_and_classify_transactions(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    account_id = store.accounts()[0]["id"]
+    category_id = next(category["id"] for category in store.categories() if category["name"] == "Alimentación")
+    subcategory = store.add_subcategory(category_id, "Supermercado")
+
+    assert store.subcategories(category_id)[0]["name"] == "Supermercado"
+    assert store.add_transaction({
+        "account_id": account_id,
+        "category_id": category_id,
+        "subcategory_id": subcategory["id"],
+        "transaction_date": "2026-10-01",
+        "description": "Compra semanal",
+        "amount": 125,
+    }) is True
+    row = store.transactions("2026-10")[0]
+    assert row["category_name"] == "Alimentación"
+    assert row["subcategory_name"] == "Supermercado"
+    store.close()
+
+
+def test_deleting_subcategory_keeps_transaction_category(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    account_id = store.accounts()[0]["id"]
+    category_id = store.categories()[0]["id"]
+    subcategory = store.add_subcategory(category_id, "Temporal")
+    store.add_transaction({
+        "account_id": account_id,
+        "category_id": category_id,
+        "subcategory_id": subcategory["id"],
+        "transaction_date": "2026-10-02",
+        "description": "Compra",
+        "amount": 10,
+    })
+
+    store.delete_subcategory(subcategory["id"])
+    row = store.transactions("2026-10")[0]
+    assert row["category_id"] == category_id
+    assert row["subcategory_id"] is None
+    store.close()
+
+
+def test_reuses_previous_classification_for_repeated_description(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    account_id = store.accounts()[0]["id"]
+    category_id = next(category["id"] for category in store.categories() if category["name"] == "Transporte")
+    subcategory = store.add_subcategory(category_id, "Parqueo")
+    base = {"account_id": account_id, "category_id": category_id, "subcategory_id": subcategory["id"], "description": "PARQUEO PORTALES COMPASS", "amount": 10}
+    assert store.add_transaction({**base, "transaction_date": "2026-10-01"}) is True
+
+    suggestion = store.suggest_classification("Parqueo Portales Compass")
+    assert suggestion == {"category_id": category_id, "subcategory_id": subcategory["id"]}
+    assert store.add_transaction({"account_id": account_id, "transaction_date": "2026-10-02", "description": "Parqueo Portales Compass", "amount": 12}) is True
+    repeated = store.transactions("2026-10")[0]
+    assert repeated["category_id"] == category_id
+    assert repeated["subcategory_id"] == subcategory["id"]
+    store.close()

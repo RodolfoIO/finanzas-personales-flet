@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -48,8 +50,6 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
 CREATE INDEX IF NOT EXISTS idx_transactions_account ON transactions(account_id);
 CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category_id);
-CREATE INDEX IF NOT EXISTS idx_transactions_subcategory ON transactions(subcategory_id);
-CREATE INDEX IF NOT EXISTS idx_subcategories_category ON subcategories(category_id);
 """
 
 
@@ -57,24 +57,42 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _classification_key(description: str) -> str:
+    normalized = unicodedata.normalize("NFKD", description.lower())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    # Ignora números variables como referencias, cuotas o números de local.
+    stable_tokens = [token for token in tokens if not token.isdigit() and len(token) > 1]
+    return " ".join(stable_tokens)
+
+
 def _load_dotenv() -> None:
     """Carga un .env local sin reemplazar variables ya exportadas."""
-    env_path = Path(os.getenv("FINANZAS_ENV_FILE", ".env")).expanduser()
-    if not env_path.is_file():
-        return
-    try:
-        lines = env_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    configured_file = os.getenv("FINANZAS_ENV_FILE", "").strip()
+    if configured_file:
+        candidates = [Path(configured_file).expanduser()]
+    else:
+        # Flet puede iniciar la app con un cwd distinto al de la raíz del proyecto.
+        candidates = [Path.cwd() / ".env", Path(__file__).resolve().parents[1] / ".env"]
+    for env_path in candidates:
+        if not env_path.is_file():
             continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("\"'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        try:
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("\"'")
+            # Una variable vacía del entorno no debe impedir cargar el .env.
+            if key and not os.environ.get(key):
+                os.environ[key] = value
+        if os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_KEY"):
+            break
 
 
 class SupabaseClient:
@@ -85,6 +103,7 @@ class SupabaseClient:
         key = os.getenv("SUPABASE_KEY", "").strip()
         self.base_url = f"{url}/rest/v1" if url and key else ""
         self.key = key
+        self.last_error: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -92,6 +111,7 @@ class SupabaseClient:
 
     def request(self, method: str, table: str, payload: Any = None, query: str = "") -> Any:
         if not self.enabled:
+            self.last_error = "Supabase no está configurado"
             return None
         url = f"{self.base_url}/{table}"
         if query:
@@ -105,19 +125,29 @@ class SupabaseClient:
         try:
             with urllib.request.urlopen(request, timeout=8) as response:
                 raw = response.read().decode("utf-8")
+                self.last_error = None
                 return json.loads(raw) if raw else None
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace").strip()
+            self.last_error = f"HTTP {error.code} en {table}: {detail[:300]}"
+            return None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            self.last_error = f"{type(error).__name__}: {error}"
             return None
 
-    def upsert(self, table: str, row: dict[str, Any]) -> None:
+    def upsert(self, table: str, row: dict[str, Any]) -> bool:
         self.request("POST", table, row)
+        return self.last_error is None
 
-    def upsert_many(self, table: str, rows: list[dict[str, Any]]) -> None:
-        if rows:
-            self.request("POST", table, rows)
+    def upsert_many(self, table: str, rows: list[dict[str, Any]]) -> bool:
+        if not rows:
+            return True
+        self.request("POST", table, rows)
+        return self.last_error is None
 
-    def delete(self, table: str, query: str) -> None:
+    def delete(self, table: str, query: str) -> bool:
         self.request("DELETE", table, query=query)
+        return self.last_error is None
 
     def all(self, table: str) -> list[dict[str, Any]]:
         result = self.request("GET", table, query="select=*")
@@ -136,6 +166,7 @@ class DataStore:
         self.db.executescript(SCHEMA)
         self._ensure_schema()
         self.remote = SupabaseClient()
+        self.last_sync_error: str | None = None
         self._seed()
         if sync_remote:
             self.sync_from_supabase()
@@ -163,22 +194,27 @@ class DataStore:
             for name, color, budget in DEFAULT_CATEGORIES:
                 self.db.execute("INSERT INTO categories (id, name, color, monthly_budget, created_at) VALUES (?, ?, ?, ?, ?)", (str(uuid4()), name, color, budget, _now()))
         if self.db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0:
-            self.db.execute("INSERT INTO accounts (id, name, institution, account_type, currency, created_at) VALUES (?, ?, ?, ?, ?, ?)", (str(uuid4()), "Cuenta principal", "Sin configurar", "cuenta", "GTQ", _now()))
+            self.db.execute("INSERT INTO accounts (id, name, institution, account_type, currency, current_balance, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), "Cuenta principal", "Sin configurar", "cuenta", "GTQ", 0, _now()))
         self.db.commit()
 
     def sync_from_supabase(self) -> None:
         """Fusiona ambas fuentes y sube también las filas que solo están localmente."""
         if not self.remote.enabled:
             return
+        self.last_sync_error = None
         try:
             for table in ("categories", "subcategories", "accounts", "transactions"):
                 rows = self.remote.all(table)
+                if self.remote.last_error:
+                    self.last_sync_error = self.remote.last_error
+                    continue
                 remote_ids = {row.get("id") for row in rows}
                 for row in rows:
                     self._upsert_local(table, row)
                 missing = [row for row in self._local_rows(table) if row.get("id") not in remote_ids]
                 for start in range(0, len(missing), 500):
-                    self.remote.upsert_many(table, missing[start : start + 500])
+                    if not self.remote.upsert_many(table, missing[start : start + 500]):
+                        self.last_sync_error = self.remote.last_error
             self.db.commit()
         except sqlite3.Error:
             return
@@ -198,7 +234,10 @@ class DataStore:
 
     def _write_remote(self, table: str, row: dict[str, Any]) -> None:
         if self.remote.enabled:
-            self.remote.upsert(table, row)
+            if self.remote.upsert(table, row):
+                self.last_sync_error = None
+            else:
+                self.last_sync_error = self.remote.last_error
 
     def categories(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.execute("SELECT * FROM categories ORDER BY name").fetchall()]
@@ -256,6 +295,20 @@ class DataStore:
                 return row[0] if row else None
         row = self.db.execute("SELECT id FROM categories WHERE name = 'Otros'").fetchone()
         return row[0] if row else None
+
+    def suggest_classification(self, description: str) -> dict[str, Any] | None:
+        """Busca la clasificación más reciente para una descripción equivalente."""
+        key = _classification_key(description)
+        if not key:
+            return None
+        rows = self.db.execute(
+            "SELECT description, category_id, subcategory_id FROM transactions "
+            "WHERE category_id IS NOT NULL ORDER BY transaction_date DESC, created_at DESC"
+        ).fetchall()
+        for row in rows:
+            if _classification_key(row["description"]) == key:
+                return {"category_id": row["category_id"], "subcategory_id": row["subcategory_id"]}
+        return None
 
     def find_account(self, name: str, institution: str, account_type: str) -> dict[str, Any] | None:
         row = self.db.execute(
@@ -320,7 +373,10 @@ class DataStore:
         self.db.execute("DELETE FROM subcategories WHERE id = ?", (subcategory_id,))
         self.db.commit()
         if self.remote.enabled:
-            self.remote.delete("subcategories", f"id=eq.{subcategory_id}")
+            if self.remote.delete("subcategories", f"id=eq.{subcategory_id}"):
+                self.last_sync_error = None
+            else:
+                self.last_sync_error = self.remote.last_error
 
     def add_account(
         self,
@@ -348,8 +404,16 @@ class DataStore:
         self._write_remote("categories", row)
 
     def add_transaction(self, row: dict[str, Any]) -> bool:
-        category_id = row.get("category_id") or self.guess_category_id(row["description"])
+        description = row["description"].strip()
+        category_id = row.get("category_id")
         subcategory_id = row.get("subcategory_id") or None
+        if not category_id and not subcategory_id:
+            suggestion = self.suggest_classification(description)
+            if suggestion:
+                category_id = suggestion["category_id"]
+                subcategory_id = suggestion["subcategory_id"]
+            else:
+                category_id = self.guess_category_id(description)
         if subcategory_id:
             parent = self.db.execute("SELECT category_id FROM subcategories WHERE id = ?", (subcategory_id,)).fetchone()
             if not parent:
@@ -357,7 +421,7 @@ class DataStore:
             if category_id and category_id != parent["category_id"]:
                 raise ValueError("La subcategoría no pertenece a la categoría seleccionada")
             category_id = parent["category_id"]
-        data = {"id": row.get("id", str(uuid4())), "account_id": row["account_id"], "category_id": category_id, "subcategory_id": subcategory_id, "transaction_date": row["transaction_date"], "description": row["description"].strip(), "amount": float(row["amount"]), "transaction_type": row.get("transaction_type", "expense"), "source": row.get("source", "manual"), "source_hash": row.get("source_hash") or f"{row['account_id']}|{row['transaction_date']}|{row['description']}|{row['amount']}", "notes": row.get("notes", ""), "created_at": row.get("created_at", _now())}
+        data = {"id": row.get("id", str(uuid4())), "account_id": row["account_id"], "category_id": category_id, "subcategory_id": subcategory_id, "transaction_date": row["transaction_date"], "description": description, "amount": float(row["amount"]), "transaction_type": row.get("transaction_type", "expense"), "source": row.get("source", "manual"), "source_hash": row.get("source_hash") or f"{row['account_id']}|{row['transaction_date']}|{description}|{row['amount']}", "notes": row.get("notes", ""), "created_at": row.get("created_at", _now())}
         try:
             self.db.execute("INSERT INTO transactions (id, account_id, category_id, subcategory_id, transaction_date, description, amount, transaction_type, source, source_hash, notes, created_at) VALUES (:id, :account_id, :category_id, :subcategory_id, :transaction_date, :description, :amount, :transaction_type, :source, :source_hash, :notes, :created_at)", data)
             self.db.commit()
