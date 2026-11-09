@@ -29,6 +29,7 @@ create table if not exists public.accounts (
 create table if not exists public.transactions (
   id uuid primary key,
   account_id uuid not null references public.accounts(id) on delete cascade,
+  destination_account_id uuid references public.accounts(id) on delete cascade,
   category_id uuid references public.categories(id) on delete set null,
   subcategory_id uuid references public.subcategories(id) on delete set null,
   transaction_date date not null,
@@ -42,8 +43,20 @@ create table if not exists public.transactions (
 );
 
 alter table public.transactions add column if not exists subcategory_id uuid references public.subcategories(id) on delete set null;
+alter table public.transactions add column if not exists destination_account_id uuid references public.accounts(id) on delete cascade;
 create index if not exists idx_subcategories_category on public.subcategories(category_id);
 create index if not exists idx_transactions_subcategory on public.transactions(subcategory_id);
+create index if not exists idx_transactions_destination_account on public.transactions(destination_account_id);
+
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'transactions_transfer_shape') then
+    alter table public.transactions add constraint transactions_transfer_shape check (
+      (transaction_type = 'transfer' and destination_account_id is not null and category_id is null and subcategory_id is null and destination_account_id <> account_id)
+      or (transaction_type <> 'transfer' and destination_account_id is null)
+    );
+  end if;
+end $$;
 
 alter table public.categories enable row level security;
 alter table public.subcategories enable row level security;
@@ -61,4 +74,4 @@ create policy "personal accounts" on public.accounts for all using (true) with c
 create policy "personal transactions" on public.transactions for all using (true) with check (true);
 
 -- Necesario si el proyecto restringe la exposición automática de tablas al Data API.
-grant select, insert, update, delete on table public.subcategories to anon, authenticated;
+grant select, insert, update, delete on table public.accounts, public.transactions, public.subcategories to anon, authenticated;

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from importers import parse_file
 from migration import migrate_existing_data
 from store import DataStore
@@ -40,6 +42,56 @@ def test_multiple_named_accounts_and_cards_are_supported(tmp_path: Path):
 
     names = {row["name"] for row in store.accounts()}
     assert {"Cuenta de ahorro", "Tarjeta Platinum", "Tarjeta de viajes"} <= names
+    store.close()
+
+
+def test_deleting_account_removes_its_movements_as_origin_or_destination(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    store.remote.base_url = ""
+    store.remote.key = ""
+    origin = store.accounts()[0]["id"]
+    destination = store.add_account("Cuenta destino", "BAC", "cuenta")["id"]
+    other = store.add_account("Cuenta intacta", "G&T", "cuenta")["id"]
+
+    store.add_transaction({"account_id": origin, "transaction_date": "2026-10-01", "description": "Gasto", "amount": 25})
+    store.add_transfer(origin, destination, 100, "2026-10-02", "Transferencia saliente")
+    store.add_transfer(other, origin, 50, "2026-10-03", "Transferencia entrante")
+    store.add_transaction({"account_id": other, "transaction_date": "2026-10-04", "description": "Conservar", "amount": 10})
+
+    assert store.account_transaction_count(origin) == 3
+    assert store.delete_account(origin) == 3
+    assert not any(account["id"] == origin for account in store.accounts())
+    assert len(store.transactions()) == 1
+    assert store.transactions()[0]["description"] == "Conservar"
+    store.close()
+
+
+def test_deleting_last_account_is_allowed(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    store.remote.base_url = ""
+    store.remote.key = ""
+    account_id = store.accounts()[0]["id"]
+
+    assert store.delete_account(account_id) == 0
+    assert store.accounts() == []
+    store.close()
+
+
+def test_delete_account_keeps_local_data_when_remote_delete_fails(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    account_id = store.accounts()[0]["id"]
+
+    class FailingRemote:
+        enabled = True
+        last_error = "Error remoto simulado"
+
+        def delete(self, table: str, query: str) -> bool:
+            return False
+
+    store.remote = FailingRemote()
+    with pytest.raises(RuntimeError, match="Error remoto simulado"):
+        store.delete_account(account_id)
+    assert any(account["id"] == account_id for account in store.accounts())
     store.close()
 
 
@@ -121,4 +173,70 @@ def test_reuses_previous_classification_for_repeated_description(tmp_path: Path)
     repeated = store.transactions("2026-10")[0]
     assert repeated["category_id"] == category_id
     assert repeated["subcategory_id"] == subcategory["id"]
+    store.close()
+
+
+def test_transfer_is_single_uncategorized_record_and_excluded_from_summary(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    origin = store.accounts()[0]["id"]
+    destination = store.add_account("Cuenta destino", "BAC", "cuenta")["id"]
+
+    assert store.add_transfer(origin, destination, 250, "2026-10-03", "Fondo de ahorro") is True
+    row = store.transactions("2026-10")[0]
+    assert row["transaction_type"] == "transfer"
+    assert row["destination_account_id"] == destination
+    assert row["category_id"] is None
+    assert row["subcategory_id"] is None
+    assert store.summary("2026-10") == {"expenses": 0, "income": 0, "balance": 0, "by_category": {}, "count": 0}
+    assert store.account_balance(origin) == -250
+    assert store.account_balance(destination) == 250
+    store.close()
+
+
+def test_card_payment_reduces_debt_and_bridge_transfer_balances(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    bank_a = store.accounts()[0]["id"]
+    bank_b = store.add_account("Cuenta puente", "BAC", "cuenta")["id"]
+    card = store.add_account("Visa", "BAC", "tarjeta")["id"]
+
+    assert store.add_transaction({"account_id": card, "transaction_date": "2026-10-01", "description": "Compra", "amount": 500, "transaction_type": "expense"})
+    assert store.add_transfer(bank_a, bank_b, 200, "2026-10-02", "Fondo para pago")
+    assert store.add_transfer(bank_b, card, 200, "2026-10-03", "Pago de tarjeta Visa")
+
+    assert store.account_balance(card) == 300
+    assert store.account_balance(bank_a) == -200
+    assert store.account_balance(bank_b) == 0
+    assert store.summary("2026-10")["expenses"] == 500
+    assert store.summary("2026-10")["count"] == 1
+    store.close()
+
+
+def test_transfer_validation_and_destination_sensitive_deduplication(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    origin = store.accounts()[0]["id"]
+    destination = store.add_account("Destino", "BAC", "cuenta")["id"]
+
+    with pytest.raises(ValueError):
+        store.add_transfer(origin, None, 10, "2026-10-01")
+    with pytest.raises(ValueError):
+        store.add_transfer(origin, origin, 10, "2026-10-01")
+    with pytest.raises(ValueError):
+        store.add_transfer(origin, destination, 10, "2026-10-01", category_id="category")
+
+    assert store.add_transfer(origin, destination, 10, "2026-10-01", "A") is True
+    other_destination = store.add_account("Otro destino", "BAC", "cuenta")["id"]
+    assert store.add_transfer(origin, other_destination, 10, "2026-10-01", "A") is True
+    store.close()
+
+
+def test_transaction_type_can_be_changed_and_normalizes_amount_sign(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    account_id = store.accounts()[0]["id"]
+    assert store.add_transaction({"account_id": account_id, "transaction_date": "2026-10-01", "description": "Movimiento", "amount": 75, "transaction_type": "expense"})
+
+    transaction_id = store.transactions()[0]["id"]
+    store.update_transaction_type(transaction_id, "income")
+    row = store.transactions()[0]
+    assert row["transaction_type"] == "income"
+    assert row["amount"] == -75
     store.close()

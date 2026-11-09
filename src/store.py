@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS transactions (
     id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), category_id TEXT REFERENCES categories(id),
     subcategory_id TEXT REFERENCES subcategories(id) ON DELETE SET NULL,
+    destination_account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
     transaction_date TEXT NOT NULL, description TEXT NOT NULL, amount REAL NOT NULL,
     transaction_type TEXT NOT NULL DEFAULT 'expense', source TEXT NOT NULL DEFAULT 'manual',
     source_hash TEXT UNIQUE, notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
@@ -183,8 +184,11 @@ class DataStore:
         columns = {column[1] for column in self.db.execute("PRAGMA table_info(transactions)").fetchall()}
         if "subcategory_id" not in columns:
             self.db.execute("ALTER TABLE transactions ADD COLUMN subcategory_id TEXT REFERENCES subcategories(id) ON DELETE SET NULL")
+        if "destination_account_id" not in columns:
+            self.db.execute("ALTER TABLE transactions ADD COLUMN destination_account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE")
         self.db.executescript(
             "CREATE INDEX IF NOT EXISTS idx_transactions_subcategory ON transactions(subcategory_id);"
+            "CREATE INDEX IF NOT EXISTS idx_transactions_destination_account ON transactions(destination_account_id);"
             "CREATE INDEX IF NOT EXISTS idx_subcategories_category ON subcategories(category_id);"
         )
         self.db.commit()
@@ -252,10 +256,36 @@ class DataStore:
         return [dict(row) for row in self.db.execute(query, params).fetchall()]
 
     def accounts(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.db.execute("SELECT * FROM accounts ORDER BY name").fetchall()]
+        accounts = [dict(row) for row in self.db.execute("SELECT * FROM accounts ORDER BY name").fetchall()]
+        for account in accounts:
+            account["balance"] = self.account_balance(account["id"])
+        return accounts
+
+    def account_balance(self, account_id: str) -> float:
+        account = self.db.execute("SELECT account_type FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        if not account:
+            raise ValueError("La cuenta no existe")
+        if account["account_type"] == "tarjeta":
+            row = self.db.execute(
+                "SELECT COALESCE(SUM(CASE WHEN t.transaction_type = 'expense' THEN ABS(t.amount) "
+                "WHEN t.transaction_type = 'transfer' AND t.account_id = ? THEN ABS(t.amount) "
+                "WHEN t.transaction_type = 'transfer' AND t.destination_account_id = ? THEN -ABS(t.amount) ELSE 0 END), 0) AS balance "
+                "FROM transactions t WHERE t.account_id = ? OR t.destination_account_id = ?",
+                (account_id, account_id, account_id, account_id),
+            ).fetchone()
+        else:
+            row = self.db.execute(
+                "SELECT COALESCE(SUM(CASE WHEN t.transaction_type = 'income' AND t.account_id = ? THEN ABS(t.amount) "
+                "WHEN t.transaction_type = 'expense' AND t.account_id = ? THEN -ABS(t.amount) "
+                "WHEN t.transaction_type = 'transfer' AND t.account_id = ? THEN -ABS(t.amount) "
+                "WHEN t.transaction_type = 'transfer' AND t.destination_account_id = ? THEN ABS(t.amount) ELSE 0 END), 0) AS balance "
+                "FROM transactions t WHERE t.account_id = ? OR t.destination_account_id = ?",
+                (account_id, account_id, account_id, account_id, account_id, account_id),
+            ).fetchone()
+        return float(row["balance"])
 
     def transactions(self, month: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
-        query = "SELECT t.*, a.name AS account_name, a.institution, c.name AS category_name, c.color AS category_color, s.name AS subcategory_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN categories c ON c.id = t.category_id LEFT JOIN subcategories s ON s.id = t.subcategory_id"
+        query = "SELECT t.*, a.name AS account_name, a.institution, d.name AS destination_account_name, c.name AS category_name, c.color AS category_color, s.name AS subcategory_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts d ON d.id = t.destination_account_id LEFT JOIN categories c ON c.id = t.category_id LEFT JOIN subcategories s ON s.id = t.subcategory_id"
         params: list[Any] = []
         if month:
             query += " WHERE substr(t.transaction_date, 1, 7) = ?"
@@ -268,14 +298,15 @@ class DataStore:
 
     def summary(self, month: str) -> dict[str, Any]:
         rows = self.transactions(month)
-        expenses = sum(row["amount"] for row in rows if row["amount"] > 0 and row["transaction_type"] == "expense")
-        income = sum(abs(row["amount"]) for row in rows if row["amount"] < 0 or row["transaction_type"] == "income")
+        report_rows = [row for row in rows if row["transaction_type"] in {"expense", "income"}]
+        expenses = sum(abs(row["amount"]) for row in report_rows if row["transaction_type"] == "expense")
+        income = sum(abs(row["amount"]) for row in report_rows if row["transaction_type"] == "income")
         by_category: dict[str, float] = {}
-        for row in rows:
-            if row["amount"] > 0 and row["transaction_type"] == "expense":
+        for row in report_rows:
+            if row["transaction_type"] == "expense":
                 name = row["category_name"] or "Sin clasificar"
-                by_category[name] = by_category.get(name, 0) + row["amount"]
-        return {"expenses": expenses, "income": income, "balance": income - expenses, "by_category": by_category, "count": len(rows)}
+                by_category[name] = by_category.get(name, 0) + abs(row["amount"])
+        return {"expenses": expenses, "income": income, "balance": income - expenses, "by_category": by_category, "count": len(report_rows)}
 
     def guess_category_id(self, description: str) -> str | None:
         text = description.lower()
@@ -397,6 +428,36 @@ class DataStore:
         self._write_remote("accounts", row)
         return row
 
+    def account_transaction_count(self, account_id: str) -> int:
+        if not self.db.execute("SELECT 1 FROM accounts WHERE id = ?", (account_id,)).fetchone():
+            raise ValueError("La cuenta no existe")
+        row = self.db.execute(
+            "SELECT COUNT(*) AS count FROM transactions "
+            "WHERE account_id = ? OR destination_account_id = ?",
+            (account_id, account_id),
+        ).fetchone()
+        return int(row["count"])
+
+    def delete_account(self, account_id: str) -> int:
+        """Elimina una cuenta y todos sus movimientos, local y remotamente."""
+        deleted_count = self.account_transaction_count(account_id)
+
+        # El borrado remoto ocurre primero para no perder la copia local si falla.
+        # La FK de Supabase elimina en cascada los movimientos relacionados.
+        if self.remote.enabled:
+            if not self.remote.delete("accounts", f"id=eq.{account_id}"):
+                self.last_sync_error = self.remote.last_error
+                raise RuntimeError(self.remote.last_error or "No se pudo eliminar la cuenta en Supabase")
+            self.last_sync_error = None
+
+        self.db.execute(
+            "DELETE FROM transactions WHERE account_id = ? OR destination_account_id = ?",
+            (account_id, account_id),
+        )
+        self.db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+        self.db.commit()
+        return deleted_count
+
     def save_budget(self, category_id: str, amount: float) -> None:
         self.db.execute("UPDATE categories SET monthly_budget = ? WHERE id = ?", (amount, category_id))
         self.db.commit()
@@ -404,6 +465,15 @@ class DataStore:
         self._write_remote("categories", row)
 
     def add_transaction(self, row: dict[str, Any]) -> bool:
+        transaction_type = row.get("transaction_type", "expense")
+        if transaction_type == "transfer":
+            return self.add_transfer(
+                origin_account_id=row["account_id"], destination_account_id=row.get("destination_account_id"),
+                amount=row["amount"], transaction_date=row["transaction_date"],
+                description=row.get("description", ""), notes=row.get("notes", ""), id=row.get("id"),
+                source=row.get("source", "manual"), source_hash=row.get("source_hash"), created_at=row.get("created_at"),
+                category_id=row.get("category_id"), subcategory_id=row.get("subcategory_id"),
+            )
         description = row["description"].strip()
         category_id = row.get("category_id")
         subcategory_id = row.get("subcategory_id") or None
@@ -421,9 +491,33 @@ class DataStore:
             if category_id and category_id != parent["category_id"]:
                 raise ValueError("La subcategoría no pertenece a la categoría seleccionada")
             category_id = parent["category_id"]
-        data = {"id": row.get("id", str(uuid4())), "account_id": row["account_id"], "category_id": category_id, "subcategory_id": subcategory_id, "transaction_date": row["transaction_date"], "description": description, "amount": float(row["amount"]), "transaction_type": row.get("transaction_type", "expense"), "source": row.get("source", "manual"), "source_hash": row.get("source_hash") or f"{row['account_id']}|{row['transaction_date']}|{description}|{row['amount']}", "notes": row.get("notes", ""), "created_at": row.get("created_at", _now())}
+        data = {"id": row.get("id", str(uuid4())), "account_id": row["account_id"], "destination_account_id": None, "category_id": category_id, "subcategory_id": subcategory_id, "transaction_date": row["transaction_date"], "description": description, "amount": float(row["amount"]), "transaction_type": transaction_type, "source": row.get("source", "manual"), "source_hash": row.get("source_hash") or f"{row['account_id']}|{row['transaction_date']}|{description}|{row['amount']}", "notes": row.get("notes", ""), "created_at": row.get("created_at", _now())}
         try:
-            self.db.execute("INSERT INTO transactions (id, account_id, category_id, subcategory_id, transaction_date, description, amount, transaction_type, source, source_hash, notes, created_at) VALUES (:id, :account_id, :category_id, :subcategory_id, :transaction_date, :description, :amount, :transaction_type, :source, :source_hash, :notes, :created_at)", data)
+            self.db.execute("INSERT INTO transactions (id, account_id, destination_account_id, category_id, subcategory_id, transaction_date, description, amount, transaction_type, source, source_hash, notes, created_at) VALUES (:id, :account_id, :destination_account_id, :category_id, :subcategory_id, :transaction_date, :description, :amount, :transaction_type, :source, :source_hash, :notes, :created_at)", data)
+            self.db.commit()
+        except sqlite3.IntegrityError:
+            return False
+        self._write_remote("transactions", data)
+        return True
+
+    def add_transfer(self, origin_account_id: str, destination_account_id: str | None, amount: float,
+                     transaction_date: str, description: str = "", notes: str = "", id: str | None = None,
+                     source: str = "manual", source_hash: str | None = None, created_at: str | None = None,
+                     category_id: str | None = None, subcategory_id: str | None = None) -> bool:
+        if not destination_account_id:
+            raise ValueError("La cuenta destino es requerida")
+        if origin_account_id == destination_account_id:
+            raise ValueError("La cuenta origen y destino deben ser diferentes")
+        if not self.db.execute("SELECT 1 FROM accounts WHERE id = ?", (origin_account_id,)).fetchone() or not self.db.execute("SELECT 1 FROM accounts WHERE id = ?", (destination_account_id,)).fetchone():
+            raise ValueError("La cuenta origen o destino no existe")
+        if float(amount) <= 0:
+            raise ValueError("El monto debe ser mayor que cero")
+        if category_id or subcategory_id:
+            raise ValueError("Las transferencias no pueden tener categoría")
+        clean_description = (description or "").strip() or "Transferencia"
+        data = {"id": id or str(uuid4()), "account_id": origin_account_id, "destination_account_id": destination_account_id, "category_id": None, "subcategory_id": None, "transaction_date": transaction_date, "description": clean_description, "amount": abs(float(amount)), "transaction_type": "transfer", "source": source, "source_hash": source_hash or f"{origin_account_id}|{destination_account_id}|{transaction_date}|{clean_description}|{abs(float(amount))}", "notes": notes or "", "created_at": created_at or _now()}
+        try:
+            self.db.execute("INSERT INTO transactions (id, account_id, destination_account_id, category_id, subcategory_id, transaction_date, description, amount, transaction_type, source, source_hash, notes, created_at) VALUES (:id, :account_id, :destination_account_id, :category_id, :subcategory_id, :transaction_date, :description, :amount, :transaction_type, :source, :source_hash, :notes, :created_at)", data)
             self.db.commit()
         except sqlite3.IntegrityError:
             return False
@@ -442,3 +536,65 @@ class DataStore:
         self.db.commit()
         row = dict(self.db.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone())
         self._write_remote("transactions", row)
+
+    def update_transaction_type(self, transaction_id: str, transaction_type: str) -> None:
+        if transaction_type not in {"expense", "income", "transfer"}:
+            raise ValueError("Tipo de movimiento no válido")
+        row = self.db.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
+        if not row:
+            raise ValueError("El movimiento no existe")
+        if transaction_type == "transfer" and not row["destination_account_id"]:
+            raise ValueError("Una transferencia requiere cuenta destino")
+        if transaction_type == "transfer":
+            self.db.execute("UPDATE transactions SET transaction_type = 'transfer', category_id = NULL, subcategory_id = NULL, amount = ABS(amount) WHERE id = ?", (transaction_id,))
+        elif transaction_type == "income":
+            self.db.execute("UPDATE transactions SET transaction_type = 'income', destination_account_id = NULL, amount = -ABS(amount) WHERE id = ?", (transaction_id,))
+        else:
+            self.db.execute("UPDATE transactions SET transaction_type = 'expense', destination_account_id = NULL, amount = ABS(amount) WHERE id = ?", (transaction_id,))
+        self.db.commit()
+        updated = dict(self.db.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone())
+        self._write_remote("transactions", updated)
+
+    def update_transaction(self, transaction_id: str, row: dict[str, Any]) -> None:
+        current = self.db.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
+        if not current:
+            raise ValueError("El movimiento no existe")
+        transaction_type = row.get("transaction_type", current["transaction_type"])
+        if transaction_type == "transfer":
+            if not row.get("destination_account_id"):
+                raise ValueError("La cuenta destino es requerida")
+            if row["account_id"] == row["destination_account_id"]:
+                raise ValueError("La cuenta origen y destino deben ser diferentes")
+            if row.get("category_id") or row.get("subcategory_id"):
+                raise ValueError("Las transferencias no pueden tener categoría")
+            description = (row.get("description") or row.get("notes") or "Transferencia").strip()
+            amount = abs(float(row["amount"]))
+            category_id = subcategory_id = None
+        else:
+            if transaction_type not in {"expense", "income"}:
+                raise ValueError("Tipo de movimiento no válido")
+            if not row.get("description", "").strip():
+                raise ValueError("La descripción es requerida")
+            description = row["description"].strip()
+            amount = abs(float(row["amount"])) * (-1 if transaction_type == "income" else 1)
+            category_id = row.get("category_id") or None
+            subcategory_id = row.get("subcategory_id") or None
+            if subcategory_id:
+                parent = self.db.execute("SELECT category_id FROM subcategories WHERE id = ?", (subcategory_id,)).fetchone()
+                if not parent or parent["category_id"] != category_id:
+                    raise ValueError("La subcategoría no pertenece a la categoría seleccionada")
+        if amount == 0:
+            raise ValueError("El monto debe ser mayor que cero")
+        if not self.db.execute("SELECT 1 FROM accounts WHERE id = ?", (row["account_id"],)).fetchone():
+            raise ValueError("La cuenta no existe")
+        destination_id = row.get("destination_account_id") if transaction_type == "transfer" else None
+        if destination_id and not self.db.execute("SELECT 1 FROM accounts WHERE id = ?", (destination_id,)).fetchone():
+            raise ValueError("La cuenta destino no existe")
+        source_hash = f"{row['account_id']}|{destination_id or ''}|{row['transaction_date']}|{description}|{abs(float(row['amount']))}"
+        data = {"account_id": row["account_id"], "destination_account_id": destination_id, "category_id": category_id, "subcategory_id": subcategory_id, "transaction_date": row["transaction_date"], "description": description, "amount": amount, "transaction_type": transaction_type, "source_hash": source_hash, "notes": row.get("notes", "") or "", "id": transaction_id}
+        try:
+            self.db.execute("UPDATE transactions SET account_id = :account_id, destination_account_id = :destination_account_id, category_id = :category_id, subcategory_id = :subcategory_id, transaction_date = :transaction_date, description = :description, amount = :amount, transaction_type = :transaction_type, source_hash = :source_hash, notes = :notes WHERE id = :id", data)
+            self.db.commit()
+        except sqlite3.IntegrityError:
+            raise ValueError("Ya existe un movimiento con los mismos datos")
+        self._write_remote("transactions", dict(self.db.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()))

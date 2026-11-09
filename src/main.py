@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-import threading
 import unicodedata
 
 import flet as ft
@@ -164,6 +163,16 @@ def main(page: ft.Page):
         return [header("Resumen financiero", "Tu control presupuestario, actualizado con cada movimiento."), ft.Row([stat("Gastos del mes", money(summary["expenses"]), f"{summary['count']} movimientos", RED), stat("Ingresos", money(summary["income"]), "Entradas registradas", GREEN), stat("Disponible", money(summary["balance"]), "Ingresos menos gastos", PRIMARY), stat("Presupuesto usado", f"{budget_used:.0%}", f"de {money(budget_total)}", PRIMARY)], wrap=True, spacing=14), ft.Row(dashboard_cards, wrap=True, spacing=14)]
 
     def transaction_row(row: dict, compact: bool = False):
+        type_labels = {"expense": ("Gasto", "#FEF3F2", RED), "income": ("Ingreso", "#ECFDF3", GREEN), "transfer": ("Transferencia", "#EEEDFF", PRIMARY)}
+        type_label, type_bg, type_color = type_labels.get(row["transaction_type"], (row["transaction_type"], "#F1F3F6", MUTED))
+        type_badge = ft.Container(ft.Text(type_label, color=type_color, size=11, weight=ft.FontWeight.BOLD), bgcolor=type_bg, border_radius=12, padding=ft.Padding.symmetric(horizontal=10, vertical=6), alignment=ft.Alignment(0, 0), width=115)
+        if row["transaction_type"] == "transfer":
+            route = f"{row['account_name']} → {row.get('destination_account_name') or 'Destino'}"
+            detail = row.get("notes") or row["description"]
+            if compact:
+                return ft.Container(ft.Row([ft.Icon(ft.Icons.SWAP_HORIZ, color=PRIMARY), ft.Column([ft.Text(row["description"][:45], color=INK, weight=ft.FontWeight.W_500), ft.Text(f"{row['transaction_date']} · {route} · {detail}", size=11, color=MUTED)], expand=True), ft.Text(money(abs(row["amount"])), color=PRIMARY, weight=ft.FontWeight.BOLD)], spacing=10), padding=ft.Padding.symmetric(vertical=8))
+            amount_cell = ft.Container(ft.Text(money(abs(row["amount"])), color=PRIMARY, weight=ft.FontWeight.BOLD), width=125, alignment=ft.Alignment(1, 0))
+            return ft.DataRow(cells=[ft.DataCell(ft.Text(row["transaction_date"], color=INK)), ft.DataCell(ft.Column([ft.Text(row["description"], color=INK), ft.Text(route, color=MUTED, size=11)], spacing=2)), ft.DataCell(type_badge), ft.DataCell(ft.Text("Sin categoría", color=MUTED)), ft.DataCell(ft.Text(detail, color=MUTED, size=11)), ft.DataCell(amount_cell), ft.DataCell(ft.IconButton(icon=ft.Icons.EDIT_OUTLINED, tooltip="Editar movimiento", on_click=lambda _: open_transaction_dialog(row)))])
         amount_color = RED if row["amount"] > 0 else GREEN
         sign = "-" if row["amount"] > 0 else "+"
         category_name = row.get("category_name") or "Sin clasificar"
@@ -197,7 +206,7 @@ def main(page: ft.Page):
             description_lines.append(ft.Text(suggestion_text, color=PRIMARY, size=10, italic=True))
         description_cell = ft.Container(ft.Column(description_lines, spacing=2), width=max(310, int((page.width or 1200) * 0.27)))
         amount_cell = ft.Container(ft.Text(f"{sign}{money(abs(row['amount']))}", color=amount_color, weight=ft.FontWeight.BOLD), width=125, alignment=ft.Alignment(1, 0))
-        return ft.DataRow(cells=[ft.DataCell(date_cell), ft.DataCell(description_cell), ft.DataCell(category_dropdown), ft.DataCell(subcategory_dropdown), ft.DataCell(amount_cell)])
+        return ft.DataRow(cells=[ft.DataCell(date_cell), ft.DataCell(description_cell), ft.DataCell(type_badge), ft.DataCell(category_dropdown), ft.DataCell(subcategory_dropdown), ft.DataCell(amount_cell), ft.DataCell(ft.IconButton(icon=ft.Icons.EDIT_OUTLINED, tooltip="Editar movimiento", on_click=lambda _: open_transaction_dialog(row)))])
 
     def transactions_page():
         month = month_picker.value or current_month
@@ -213,10 +222,8 @@ def main(page: ft.Page):
             transaction_filters["subcategory_id"] = ""
         subcategory_filter = ft.Dropdown(label="Subcategoría", value=transaction_filters["subcategory_id"], width=185, options=subcategory_options, color=INK, text_style=ft.TextStyle(color=INK), label_style=ft.TextStyle(color=MUTED), border_color="#98A2B3", focused_border_color=PRIMARY, dense=True)
         description_width = max(310, int((page.width or 1200) * 0.27))
-        table = ft.DataTable(columns=[ft.DataColumn(ft.Container(ft.Text("Fecha", color=INK, weight=ft.FontWeight.BOLD), width=125)), ft.DataColumn(ft.Container(ft.Text("Descripción", color=INK, weight=ft.FontWeight.BOLD), width=description_width)), ft.DataColumn(ft.Text("Categoría", color=INK, weight=ft.FontWeight.BOLD)), ft.DataColumn(ft.Text("Subcategoría", color=INK, weight=ft.FontWeight.BOLD)), ft.DataColumn(ft.Container(ft.Text("Monto", color=INK, weight=ft.FontWeight.BOLD), width=125))], rows=[], heading_row_color="#F5F6FA", data_text_style=ft.TextStyle(color=INK), heading_text_style=ft.TextStyle(color=INK, weight=ft.FontWeight.BOLD), column_spacing=32, horizontal_margin=18, expand=True)
+        table = ft.DataTable(columns=[ft.DataColumn(ft.Container(ft.Text("Fecha", color=INK, weight=ft.FontWeight.BOLD), width=125)), ft.DataColumn(ft.Container(ft.Text("Descripción", color=INK, weight=ft.FontWeight.BOLD), width=description_width)), ft.DataColumn(ft.Text("Tipo", color=INK, weight=ft.FontWeight.BOLD)), ft.DataColumn(ft.Text("Categoría", color=INK, weight=ft.FontWeight.BOLD)), ft.DataColumn(ft.Text("Subcategoría", color=INK, weight=ft.FontWeight.BOLD)), ft.DataColumn(ft.Container(ft.Text("Monto", color=INK, weight=ft.FontWeight.BOLD), width=125)), ft.DataColumn(ft.Text("Acciones", color=INK, weight=ft.FontWeight.BOLD))], rows=[], heading_row_color="#F5F6FA", data_text_style=ft.TextStyle(color=INK), heading_text_style=ft.TextStyle(color=INK, weight=ft.FontWeight.BOLD), column_spacing=32, horizontal_margin=18, expand=True)
         count_text = ft.Text(color=INK, weight=ft.FontWeight.BOLD)
-        search_timer = {"value": None}
-
         def filtered_rows():
             terms = normalize_search_text(search.value or "").split()
             account_id = account_filter.value or ""
@@ -224,8 +231,8 @@ def main(page: ft.Page):
             subcategory_id = subcategory_filter.value or ""
             return [
                 row for row in rows
-                if (not terms or all(word in normalize_search_text(" ".join((row.get(field) or "") for field in ("description", "category_name", "subcategory_name"))) for word in terms))
-                and (not account_id or row["account_id"] == account_id)
+                if (not terms or all(word in normalize_search_text(" ".join(str(row.get(field) or "") for field in ("description", "notes", "account_name", "destination_account_name", "category_name", "subcategory_name", "transaction_type", "transaction_date"))) for word in terms))
+                and (not account_id or row["account_id"] == account_id or row.get("destination_account_id") == account_id)
                 and (not category_id or row.get("category_id") == category_id)
                 and (not subcategory_id or row.get("subcategory_id") == subcategory_id)
             ]
@@ -260,9 +267,6 @@ def main(page: ft.Page):
             filter_rows(None)
 
         def clear_filters(_):
-            if search_timer["value"]:
-                search_timer["value"].cancel()
-                search_timer["value"] = None
             search.value = ""
             account_filter.value = ""
             category_filter.value = ""
@@ -271,14 +275,8 @@ def main(page: ft.Page):
             subcategory_filter.options = [ft.DropdownOption(key="", text="Todas las subcategorías")] + [ft.DropdownOption(key=subcategory["id"], text=f"{subcategory['category_name']} · {subcategory['name']}") for subcategory in store.subcategories()]
             filter_rows(None)
 
-        def schedule_search(_):
-            if search_timer["value"]:
-                search_timer["value"].cancel()
-            search_timer["value"] = threading.Timer(0.3, lambda: filter_rows(None))
-            search_timer["value"].daemon = True
-            search_timer["value"].start()
-
-        search.on_change = schedule_search
+        # La búsqueda se ejecuta únicamente al enviar el campo con Enter.
+        search.on_submit = filter_rows
         account_filter.on_select = filter_rows
         category_filter.on_select = category_filter_changed
         subcategory_filter.on_select = filter_rows
@@ -396,12 +394,49 @@ def main(page: ft.Page):
 
     def accounts_page():
         account_cards = []
-        all_transactions = store.transactions()
         for account in store.accounts():
-            total = sum(row["amount"] for row in all_transactions if row["account_id"] == account["id"])
-            account_cards.append(card(ft.Column([ft.Row([ft.Icon(ft.Icons.CREDIT_CARD if account["account_type"] == "tarjeta" else ft.Icons.ACCOUNT_BALANCE, color=PRIMARY), ft.Text(account["name"], size=17, weight=ft.FontWeight.BOLD, color=INK, expand=True)]), ft.Text(account["institution"] or "Institución no definida", color=MUTED), ft.Text(money(total), size=24, weight=ft.FontWeight.BOLD, color=INK), ft.Text(f"{account['account_type'].capitalize()} · {account['currency']}", color=MUTED, size=12)], spacing=9), width=300))
+            label = "Deuda" if account["account_type"] == "tarjeta" else "Saldo"
+            account_cards.append(card(ft.Column([
+                ft.Row([
+                    ft.Icon(ft.Icons.CREDIT_CARD if account["account_type"] == "tarjeta" else ft.Icons.ACCOUNT_BALANCE, color=PRIMARY),
+                    ft.Text(account["name"], size=17, weight=ft.FontWeight.BOLD, color=INK, expand=True),
+                    ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_color=RED, tooltip="Eliminar cuenta", on_click=lambda _, item=account: confirm_delete_account(item)),
+                ]),
+                ft.Text(account["institution"] or "Institución no definida", color=MUTED),
+                ft.Text(money(account["balance"]), size=24, weight=ft.FontWeight.BOLD, color=INK),
+                ft.Text(f"{label} · {account['account_type'].capitalize()} · {account['currency']}", color=MUTED, size=12),
+            ], spacing=9), width=300))
         status_color = GREEN if store.remote.enabled else MUTED
         return [header("Cuentas y tarjetas", "Agrega todas tus cuentas y tarjetas con el nombre que quieras."), ft.Row([ft.Row([ft.FilledButton("Nueva cuenta", icon=ft.Icons.ACCOUNT_BALANCE_OUTLINED, on_click=lambda _: open_account_dialog("cuenta")), ft.FilledButton("Nueva tarjeta", icon=ft.Icons.CREDIT_CARD, on_click=lambda _: open_account_dialog("tarjeta"))], spacing=10), ft.Container(expand=True), ft.Container(content=ft.Row([ft.Icon(ft.Icons.CLOUD_DONE, color=status_color), ft.Text(store.backend_label, color=MUTED, size=12)]), padding=10, bgcolor="#ECFDF5" if store.remote.enabled else "#F1F3F6", border_radius=10)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN), ft.Row(account_cards, wrap=True, spacing=14) if account_cards else ft.Text("Agrega tu primera cuenta o tarjeta para comenzar.", color=MUTED)]
+
+    def confirm_delete_account(account: dict):
+        movement_count = store.account_transaction_count(account["id"])
+        movement_label = "movimiento" if movement_count == 1 else "movimientos"
+
+        def close_dialog():
+            dialog.open = False
+            page.update()
+
+        def delete(_):
+            try:
+                deleted_count = store.delete_account(account["id"])
+            except (RuntimeError, ValueError) as error:
+                toast(str(error), RED)
+                return
+            close_dialog()
+            toast(f"Se eliminó «{account['name']}» y {deleted_count} {movement_label}.", GREEN)
+            render()
+
+        dialog = light_dialog(
+            "Eliminar cuenta o tarjeta",
+            ft.Text(
+                f"¿Eliminar «{account['name']}»? Se borrará la cuenta y sus {movement_count} {movement_label}. "
+                "Esta acción es permanente y no se puede deshacer.",
+                color=INK,
+            ),
+            [cancel_button(lambda _: close_dialog()), ft.FilledButton("Eliminar", bgcolor=RED, color="white", on_click=delete)],
+        )
+        page.show_dialog(dialog)
 
     def open_account_dialog(default_type: str = "cuenta"):
         is_card = default_type == "tarjeta"
@@ -430,13 +465,40 @@ def main(page: ft.Page):
         dialog = light_dialog("Agregar cuenta o tarjeta", ft.Column([name, institution, kind], tight=True, spacing=12), [cancel_button(lambda _: close_dialog()), ft.FilledButton("Guardar", color="white", bgcolor=PRIMARY, on_click=save)])
         page.show_dialog(dialog)
 
-    def open_transaction_dialog():
-        description = dialog_text_field(label="Descripción", autofocus=True)
-        amount = dialog_text_field(label="Monto", prefix="Q ", keyboard_type=ft.KeyboardType.NUMBER)
-        account = dialog_dropdown(label="Cuenta o tarjeta", options=[ft.DropdownOption(key=a["id"], text=a["name"]) for a in store.accounts()])
-        category = dialog_dropdown(label="Categoría", options=[ft.DropdownOption(key="", text="Sin clasificar")] + [ft.DropdownOption(key=c["id"], text=c["name"]) for c in store.categories()])
-        subcategory = dialog_dropdown(label="Subcategoría", options=[ft.DropdownOption(key="", text="Selecciona una categoría")], disabled=True)
-        kind = dialog_dropdown(label="Tipo", value="expense", options=[ft.DropdownOption(key="expense", text="Gasto"), ft.DropdownOption(key="income", text="Ingreso")])
+    def open_transaction_dialog(transaction: dict | None = None):
+        editing = transaction is not None
+        description = dialog_text_field(label="Descripción", value=(transaction or {}).get("description", ""), autofocus=True)
+        notes = dialog_text_field(label="Notas o detalle", value=(transaction or {}).get("notes", ""), hint_text="Pago de tarjeta Visa, fondo de ahorro...", visible=False)
+        amount = dialog_text_field(label="Monto", prefix="Q ", value=str(abs((transaction or {}).get("amount", ""))) if editing else "", keyboard_type=ft.KeyboardType.NUMBER)
+        transaction_date = dialog_text_field(label="Fecha", value=(transaction or {}).get("transaction_date", date.today().isoformat()))
+        accounts = store.accounts()
+        account = dialog_dropdown(label="Cuenta o tarjeta", value=(transaction or {}).get("account_id", ""), options=[ft.DropdownOption(key=a["id"], text=a["name"]) for a in accounts])
+        destination = dialog_dropdown(label="Cuenta destino", value=(transaction or {}).get("destination_account_id", ""), options=[ft.DropdownOption(key=a["id"], text=a["name"]) for a in accounts], visible=False)
+        category = dialog_dropdown(label="Categoría", value=(transaction or {}).get("category_id", "") or "", options=[ft.DropdownOption(key="", text="Sin clasificar")] + [ft.DropdownOption(key=c["id"], text=c["name"]) for c in store.categories()])
+        initial_subcategories = store.subcategories(category.value) if category.value else []
+        subcategory = dialog_dropdown(label="Subcategoría", value=(transaction or {}).get("subcategory_id", "") or "", options=[ft.DropdownOption(key="", text="Sin subcategoría")] + [ft.DropdownOption(key=s["id"], text=s["name"]) for s in initial_subcategories], disabled=not bool(category.value))
+        kind = dialog_dropdown(label="Tipo", value=(transaction or {}).get("transaction_type", "expense"), options=[ft.DropdownOption(key="expense", text="Gasto"), ft.DropdownOption(key="income", text="Ingreso"), ft.DropdownOption(key="transfer", text="Transferencia")])
+        initial_transfer = kind.value == "transfer"
+        destination.visible = initial_transfer
+        category.visible = not initial_transfer
+        subcategory.visible = not initial_transfer
+        notes.visible = initial_transfer
+
+        def kind_changed(_):
+            is_transfer = kind.value == "transfer"
+            destination.visible = is_transfer
+            category.visible = not is_transfer
+            subcategory.visible = not is_transfer
+            notes.visible = is_transfer
+            if is_transfer:
+                category.value = ""
+                subcategory.value = ""
+            destination.update()
+            category.update()
+            subcategory.update()
+            notes.update()
+
+        kind.on_select = kind_changed
 
         def category_changed(_):
             selected_category = category.value or ""
@@ -454,17 +516,34 @@ def main(page: ft.Page):
         def save(e):
             try:
                 value = float((amount.value or "0").replace(",", ""))
-                if kind.value == "income":
-                    value = -abs(value)
-                if not description.value or not account.value:
-                    raise ValueError
-                store.add_transaction({"account_id": account.value, "category_id": category.value or None, "subcategory_id": subcategory.value or None, "transaction_date": date.today().isoformat(), "description": description.value, "amount": value, "transaction_type": kind.value})
+                datetime.strptime(transaction_date.value or "", "%Y-%m-%d")
+                if kind.value == "transfer":
+                    if not account.value or not destination.value:
+                        raise ValueError("Selecciona origen y destino")
+                    if account.value == destination.value:
+                        raise ValueError("El origen y destino deben ser diferentes")
+                    transfer_data = {"account_id": account.value, "destination_account_id": destination.value, "transaction_date": transaction_date.value, "description": description.value or notes.value or "Transferencia", "amount": value, "transaction_type": "transfer", "notes": notes.value or ""}
+                    if editing:
+                        store.update_transaction(transaction["id"], transfer_data)
+                    else:
+                        store.add_transfer(account.value, destination.value, value, transaction_date.value, description.value or notes.value or "Transferencia", notes.value or "")
+                else:
+                    if kind.value == "income":
+                        value = -abs(value)
+                    if not description.value or not account.value:
+                        raise ValueError
+                    movement_data = {"account_id": account.value, "category_id": category.value or None, "subcategory_id": subcategory.value or None, "transaction_date": transaction_date.value, "description": description.value, "amount": value, "transaction_type": kind.value, "notes": notes.value or ""}
+                    if editing:
+                        store.update_transaction(transaction["id"], movement_data)
+                    else:
+                        store.add_transaction(movement_data)
                 close_dialog()
+                toast(sync_status("Movimiento"), RED if store.last_sync_error else GREEN)
                 render()
-            except ValueError:
-                toast("Completa descripción, cuenta y monto válido", RED)
+            except ValueError as error:
+                toast(str(error) or "Completa descripción, cuenta y monto válido", RED)
 
-        dialog = light_dialog("Nuevo movimiento", ft.Column([description, amount, account, category, subcategory, kind], tight=True, spacing=12), [cancel_button(lambda _: close_dialog()), ft.FilledButton("Guardar", color="white", bgcolor=PRIMARY, on_click=save)])
+        dialog = light_dialog("Editar movimiento" if editing else "Nuevo movimiento", ft.Column([description, notes, amount, transaction_date, account, destination, category, subcategory, kind], tight=True, spacing=12), [cancel_button(lambda _: close_dialog()), ft.FilledButton("Guardar cambios" if editing else "Guardar", color="white", bgcolor=PRIMARY, on_click=save)])
         page.show_dialog(dialog)
 
     def open_import_dialog():
