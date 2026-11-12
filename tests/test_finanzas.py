@@ -211,6 +211,80 @@ def test_card_payment_reduces_debt_and_bridge_transfer_balances(tmp_path: Path):
     store.close()
 
 
+def test_card_payment_credit_is_pending_and_not_income(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    bank = store.accounts()[0]["id"]
+    card = store.add_account("Visa", "BAC", "tarjeta")["id"]
+    source = tmp_path / "card.csv"
+    source.write_text(
+        "Fecha de Transacción,Referencia de Transacción,Código de Transacción,Descripción de Transacción,Débito de Transacción,Crédito de Transacción,Balance de Transacción\n"
+        "06/10/2026,1,DB,COMPRA SUPERMERCADO,500,0,0\n"
+        "07/10/2026,2,CR,PAGO TARJETA VISA,0,200,0\n",
+        encoding="utf-8",
+    )
+
+    rows = parse_file(source, card, store)
+    assert rows[1]["transaction_type"] == "card_payment_pending"
+    assert store.add_transaction(rows[0]) is True
+    assert store.add_transaction(rows[1]) is True
+    assert store.summary("2026-10")["income"] == 0
+    assert store.summary("2026-10")["expenses"] == 500
+    assert store.card_payment_candidates(card)[0]["description"] == "PAGO TARJETA VISA"
+    assert store.account_balance(card) == 500
+
+    store.convert_card_payment(store.card_payment_candidates(card)[0]["id"], bank)
+
+    assert store.summary("2026-10")["income"] == 0
+    assert store.summary("2026-10")["expenses"] == 500
+    assert store.account_balance(bank) == -200
+    assert store.account_balance(card) == 300
+    assert store.transactions("2026-10")[0]["transaction_type"] == "transfer"
+    store.close()
+
+
+def test_card_payment_reconciles_bank_debit_in_either_import_order(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    bank = store.accounts()[0]["id"]
+    card = store.add_account("Visa", "BAC", "tarjeta")["id"]
+    assert store.add_transaction({"account_id": card, "transaction_date": "2026-10-01", "description": "Compra", "amount": 500})
+    pending = {"account_id": card, "transaction_date": "2026-10-03", "description": "PAGO TARJETA VISA", "amount": -200, "transaction_type": "card_payment_pending", "source_hash": "card-payment-1"}
+    assert store.add_transaction(pending)
+    payment_id = store.card_payment_candidates(card)[0]["id"]
+    store.convert_card_payment(payment_id, bank)
+
+    assert store.add_transaction({"account_id": bank, "transaction_date": "2026-10-03", "description": "PAGO TARJETA VISA", "amount": 200}) is False
+    assert store.summary("2026-10")["expenses"] == 500
+
+    other_bank = store.add_account("Cuenta 2", "BAC", "cuenta")["id"]
+    other_card = store.add_account("Mastercard", "BAC", "tarjeta")["id"]
+    assert store.add_transaction({"account_id": other_card, "transaction_date": "2026-10-05", "description": "Compra", "amount": 300})
+    assert store.add_transaction({"account_id": other_bank, "transaction_date": "2026-10-07", "description": "PAGO TARJETA MASTERCARD", "amount": 100})
+    assert store.add_transaction({**pending, "account_id": other_card, "transaction_date": "2026-10-07", "description": "PAGO TARJETA MASTERCARD", "amount": -100, "source_hash": "card-payment-2"})
+    other_payment_id = store.card_payment_candidates(other_card)[0]["id"]
+    store.convert_card_payment(other_payment_id, other_bank)
+
+    assert not any(row["account_id"] == other_bank and row["transaction_type"] == "expense" for row in store.transactions())
+    assert store.account_balance(other_bank) == -100
+    assert store.account_balance(other_card) == 200
+    store.close()
+
+
+def test_historical_card_income_can_be_converted_to_payment(tmp_path: Path):
+    store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
+    bank = store.accounts()[0]["id"]
+    card = store.add_account("Visa", "BAC", "tarjeta")["id"]
+    assert store.add_transaction({"account_id": card, "transaction_date": "2026-10-01", "description": "Compra", "amount": 400})
+    assert store.add_transaction({"account_id": card, "transaction_date": "2026-10-02", "description": "PAGO TARJETA VISA", "amount": -150, "transaction_type": "income"})
+    payment = store.card_payment_candidates(card)[0]
+    store.convert_card_payment(payment["id"], bank)
+
+    row = next(item for item in store.transactions() if item["description"] == "PAGO TARJETA VISA")
+    assert row["transaction_type"] == "transfer"
+    assert store.summary("2026-10")["income"] == 0
+    assert store.account_balance(card) == 250
+    store.close()
+
+
 def test_transfer_validation_and_destination_sensitive_deduplication(tmp_path: Path):
     store = DataStore(str(tmp_path / "db.sqlite3"), sync_remote=False)
     origin = store.accounts()[0]["id"]

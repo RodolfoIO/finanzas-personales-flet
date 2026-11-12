@@ -6,7 +6,8 @@ import unicodedata
 import flet as ft
 
 from importers import import_file
-from store import DataStore
+from payment_rules import is_card_payment_description
+from store import CARD_PAYMENT_PENDING, DataStore
 
 BG = "#F7F8FC"
 INK = "#172033"
@@ -163,7 +164,7 @@ def main(page: ft.Page):
         return [header("Resumen financiero", "Tu control presupuestario, actualizado con cada movimiento."), ft.Row([stat("Gastos del mes", money(summary["expenses"]), f"{summary['count']} movimientos", RED), stat("Ingresos", money(summary["income"]), "Entradas registradas", GREEN), stat("Disponible", money(summary["balance"]), "Ingresos menos gastos", PRIMARY), stat("Presupuesto usado", f"{budget_used:.0%}", f"de {money(budget_total)}", PRIMARY)], wrap=True, spacing=14), ft.Row(dashboard_cards, wrap=True, spacing=14)]
 
     def transaction_row(row: dict, compact: bool = False):
-        type_labels = {"expense": ("Gasto", "#FEF3F2", RED), "income": ("Ingreso", "#ECFDF3", GREEN), "transfer": ("Transferencia", "#EEEDFF", PRIMARY)}
+        type_labels = {"expense": ("Gasto", "#FEF3F2", RED), "income": ("Ingreso", "#ECFDF3", GREEN), "transfer": ("Transferencia", "#EEEDFF", PRIMARY), CARD_PAYMENT_PENDING: ("Pago pendiente", "#FFF7E6", "#B54708")}
         type_label, type_bg, type_color = type_labels.get(row["transaction_type"], (row["transaction_type"], "#F1F3F6", MUTED))
         type_badge = ft.Container(ft.Text(type_label, color=type_color, size=11, weight=ft.FontWeight.BOLD), bgcolor=type_bg, border_radius=12, padding=ft.Padding.symmetric(horizontal=10, vertical=6), alignment=ft.Alignment(0, 0), width=115)
         if row["transaction_type"] == "transfer":
@@ -181,8 +182,9 @@ def main(page: ft.Page):
         suggestion = store.suggest_classification(row["description"]) if not row.get("category_id") else None
         if compact:
             return ft.Container(ft.Row([ft.Container(width=10, height=10, bgcolor=row.get("category_color") or MUTED, border_radius=10), ft.Column([ft.Text(row["description"][:45], color=INK, weight=ft.FontWeight.W_500), ft.Text(f"{row['transaction_date']} · {row['account_name']} · {classification}", size=11, color=MUTED)], expand=True), ft.Text(f"{sign}{money(abs(row['amount']))}", color=amount_color, weight=ft.FontWeight.BOLD)], spacing=10), padding=ft.Padding.symmetric(vertical=8))
+        is_card_payment_candidate = row.get("account_type") == "tarjeta" and row["amount"] < 0 and (row["transaction_type"] == CARD_PAYMENT_PENDING or (row["transaction_type"] == "income" and is_card_payment_description(row["description"])))
         options = [ft.DropdownOption(key="", text="Sin clasificar")] + [ft.DropdownOption(key=c["id"], text=c["name"]) for c in store.categories()]
-        category_dropdown = ft.Dropdown(value=row["category_id"] or "", options=options, width=155, dense=True, color=INK, text_style=ft.TextStyle(color=INK), label_style=ft.TextStyle(color=MUTED))
+        category_dropdown = ft.Dropdown(value=row["category_id"] or "", options=options, width=155, dense=True, color=INK, text_style=ft.TextStyle(color=INK), label_style=ft.TextStyle(color=MUTED), disabled=is_card_payment_candidate)
         subcategory_options = [ft.DropdownOption(key="", text="Sin subcategoría")] + [ft.DropdownOption(key=s["id"], text=s["name"]) for s in store.subcategories(row["category_id"])] if row.get("category_id") else [ft.DropdownOption(key="", text="Selecciona categoría")]
         subcategory_dropdown = ft.Dropdown(value=row.get("subcategory_id") or "", options=subcategory_options, width=165, dense=True, color=INK, text_style=ft.TextStyle(color=INK), label_style=ft.TextStyle(color=MUTED), filled=not row.get("subcategory_id"), fill_color="#26F59E0B" if not row.get("subcategory_id") else None, disabled=not row.get("category_id"))
 
@@ -206,7 +208,10 @@ def main(page: ft.Page):
             description_lines.append(ft.Text(suggestion_text, color=PRIMARY, size=10, italic=True))
         description_cell = ft.Container(ft.Column(description_lines, spacing=2), width=max(310, int((page.width or 1200) * 0.27)))
         amount_cell = ft.Container(ft.Text(f"{sign}{money(abs(row['amount']))}", color=amount_color, weight=ft.FontWeight.BOLD), width=125, alignment=ft.Alignment(1, 0))
-        return ft.DataRow(cells=[ft.DataCell(date_cell), ft.DataCell(description_cell), ft.DataCell(type_badge), ft.DataCell(category_dropdown), ft.DataCell(subcategory_dropdown), ft.DataCell(amount_cell), ft.DataCell(ft.IconButton(icon=ft.Icons.EDIT_OUTLINED, tooltip="Editar movimiento", on_click=lambda _: open_transaction_dialog(row)))])
+        action_controls = [] if row["transaction_type"] == CARD_PAYMENT_PENDING else [ft.IconButton(icon=ft.Icons.EDIT_OUTLINED, tooltip="Editar movimiento", on_click=lambda _: open_transaction_dialog(row))]
+        if is_card_payment_candidate:
+            action_controls.insert(0, ft.IconButton(icon=ft.Icons.CREDIT_CARD, icon_color="#B54708", tooltip="Convertir en pago de tarjeta", on_click=lambda _: open_card_payment_dialog(row)))
+        return ft.DataRow(cells=[ft.DataCell(date_cell), ft.DataCell(description_cell), ft.DataCell(type_badge), ft.DataCell(category_dropdown), ft.DataCell(subcategory_dropdown), ft.DataCell(amount_cell), ft.DataCell(ft.Row(action_controls, spacing=0))])
 
     def transactions_page():
         month = month_picker.value or current_month
@@ -546,6 +551,37 @@ def main(page: ft.Page):
         dialog = light_dialog("Editar movimiento" if editing else "Nuevo movimiento", ft.Column([description, notes, amount, transaction_date, account, destination, category, subcategory, kind], tight=True, spacing=12), [cancel_button(lambda _: close_dialog()), ft.FilledButton("Guardar cambios" if editing else "Guardar", color="white", bgcolor=PRIMARY, on_click=save)])
         page.show_dialog(dialog)
 
+    def open_card_payment_dialog(transaction: dict):
+        source_accounts = [account for account in store.accounts() if account["account_type"] == "cuenta"]
+        source = dialog_dropdown(label="Cuenta bancaria de origen", options=[ft.DropdownOption(key=account["id"], text=account["name"]) for account in source_accounts])
+        detail = ft.Text(
+            f"{transaction['description']} · {transaction['transaction_date']} · {money(abs(transaction['amount']))}\n"
+            "Se convertirá en una transferencia y dejará de contarse como ingreso.",
+            color=MUTED,
+        )
+
+        def close_dialog():
+            dialog.open = False
+            page.update()
+
+        def save(_):
+            try:
+                if not source.value:
+                    raise ValueError("Selecciona la cuenta bancaria que realizó el pago")
+                store.convert_card_payment(transaction["id"], source.value)
+                close_dialog()
+                toast(sync_status("Pago de tarjeta"), RED if store.last_sync_error else GREEN)
+                render()
+            except (ValueError, RuntimeError) as error:
+                toast(str(error), RED)
+
+        dialog = light_dialog(
+            "Convertir en pago de tarjeta",
+            ft.Column([detail, source], tight=True, spacing=12),
+            [cancel_button(lambda _: close_dialog()), ft.FilledButton("Convertir", color="white", bgcolor=PRIMARY, on_click=save)],
+        )
+        page.show_dialog(dialog)
+
     def open_import_dialog():
         account = dialog_dropdown(label="Importar a", options=[ft.DropdownOption(key=a["id"], text=a["name"]) for a in store.accounts()])
         help_text = ft.Text("Formatos: CSV de BAC (cuenta o tarjeta) y TXT tabulado de G&T.", size=12, color=MUTED)
@@ -571,6 +607,12 @@ def main(page: ft.Page):
         imported, skipped = import_file(e.files[0].path, file_picker.data, store)
         toast(f"Importados {imported} movimientos; omitidos {skipped} duplicados o sin monto.", GREEN)
         render()
+        pending = [
+            row for row in store.card_payment_candidates(file_picker.data)
+            if row.get("source") == e.files[0].name
+        ]
+        if pending:
+            open_card_payment_dialog(pending[0])
 
     file_picker.on_result = file_result
     month_picker.on_select = lambda _: render()

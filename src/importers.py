@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from payment_rules import is_card_payment_description
+
 
 def _number(value: str) -> float:
     clean = (value or "").strip().replace("Q", "").replace("$", "").replace(" ", "")
@@ -101,7 +103,12 @@ def _parse_gt(path: Path, account_id: str, store: Any) -> list[dict[str, Any]]:
 def _row(account_id: str, transaction_date: str, description: str, amount: float, source: str, store: Any) -> dict[str, Any]:
     clean_description = re.sub(r"\s+", " ", description).strip()
     suggestion = store.suggest_classification(clean_description) if hasattr(store, "suggest_classification") else None
-    return {"account_id": account_id, "category_id": suggestion["category_id"] if suggestion else (store.guess_category_id(clean_description) if amount > 0 else None), "subcategory_id": suggestion["subcategory_id"] if suggestion else None, "transaction_date": transaction_date, "description": clean_description, "amount": amount, "transaction_type": "expense" if amount > 0 else "income", "source": source, "source_hash": _hash(account_id, transaction_date, description, amount)}
+    account_type = store.account_type(account_id) if hasattr(store, "account_type") else "cuenta"
+    is_card_payment = account_type == "tarjeta" and amount < 0 and is_card_payment_description(clean_description)
+    transaction_type = "card_payment_pending" if is_card_payment else ("expense" if amount > 0 else "income")
+    category_id = suggestion["category_id"] if suggestion and not is_card_payment else (store.guess_category_id(clean_description) if amount > 0 else None)
+    subcategory_id = suggestion["subcategory_id"] if suggestion and not is_card_payment else None
+    return {"account_id": account_id, "category_id": category_id, "subcategory_id": subcategory_id, "transaction_date": transaction_date, "description": clean_description, "amount": amount, "transaction_type": transaction_type, "source": source, "source_hash": _hash(account_id, transaction_date, description, amount)}
 
 
 def import_file(path: str | Path, account_id: str, store: Any) -> tuple[int, int]:

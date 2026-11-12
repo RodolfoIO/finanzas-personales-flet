@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from payment_rules import days_between, is_card_payment_description
+
 
 DEFAULT_CATEGORIES = [
     ("Vivienda", "#6C63FF", 3500.0),
@@ -25,6 +27,8 @@ DEFAULT_CATEGORIES = [
     ("Deudas y pagos", "#EF4444", 2500.0),
     ("Otros", "#64748B", 1000.0),
 ]
+
+CARD_PAYMENT_PENDING = "card_payment_pending"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS categories (
@@ -261,6 +265,12 @@ class DataStore:
             account["balance"] = self.account_balance(account["id"])
         return accounts
 
+    def account_type(self, account_id: str) -> str:
+        row = self.db.execute("SELECT account_type FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        if not row:
+            raise ValueError("La cuenta no existe")
+        return str(row["account_type"])
+
     def account_balance(self, account_id: str) -> float:
         account = self.db.execute("SELECT account_type FROM accounts WHERE id = ?", (account_id,)).fetchone()
         if not account:
@@ -285,7 +295,7 @@ class DataStore:
         return float(row["balance"])
 
     def transactions(self, month: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
-        query = "SELECT t.*, a.name AS account_name, a.institution, d.name AS destination_account_name, c.name AS category_name, c.color AS category_color, s.name AS subcategory_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts d ON d.id = t.destination_account_id LEFT JOIN categories c ON c.id = t.category_id LEFT JOIN subcategories s ON s.id = t.subcategory_id"
+        query = "SELECT t.*, a.name AS account_name, a.institution, a.account_type AS account_type, d.name AS destination_account_name, c.name AS category_name, c.color AS category_color, s.name AS subcategory_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts d ON d.id = t.destination_account_id LEFT JOIN categories c ON c.id = t.category_id LEFT JOIN subcategories s ON s.id = t.subcategory_id"
         params: list[Any] = []
         if month:
             query += " WHERE substr(t.transaction_date, 1, 7) = ?"
@@ -307,6 +317,112 @@ class DataStore:
                 name = row["category_name"] or "Sin clasificar"
                 by_category[name] = by_category.get(name, 0) + abs(row["amount"])
         return {"expenses": expenses, "income": income, "balance": income - expenses, "by_category": by_category, "count": len(report_rows)}
+
+    def _matching_card_payment_transfer(
+        self,
+        source_account_id: str,
+        amount: float,
+        transaction_date: str,
+        description: str = "",
+    ) -> dict[str, Any] | None:
+        """Busca una transferencia bancaria a tarjeta que ya representa este pago."""
+        if not is_card_payment_description(description):
+            return None
+        rows = self.db.execute(
+            "SELECT t.*, d.account_type AS destination_account_type "
+            "FROM transactions t JOIN accounts d ON d.id = t.destination_account_id "
+            "WHERE t.account_id = ? AND t.transaction_type = 'transfer' "
+            "AND d.account_type = 'tarjeta' AND ABS(t.amount) = ?",
+            (source_account_id, abs(float(amount))),
+        ).fetchall()
+        for row in rows:
+            if days_between(transaction_date, row["transaction_date"]) <= 3:
+                return dict(row)
+        return None
+
+    def _matching_bank_expense(
+        self,
+        source_account_id: str,
+        amount: float,
+        transaction_date: str,
+    ) -> dict[str, Any] | None:
+        """Busca el débito bancario que pudo acompañar un pago ya importado en la tarjeta."""
+        rows = self.db.execute(
+            "SELECT * FROM transactions WHERE account_id = ? AND transaction_type = 'expense' AND ABS(amount) = ?",
+            (source_account_id, abs(float(amount))),
+        ).fetchall()
+        for row in rows:
+            if days_between(transaction_date, row["transaction_date"]) <= 3 and is_card_payment_description(row["description"]):
+                return dict(row)
+        return None
+
+    def _delete_transaction(self, transaction_id: str) -> None:
+        if self.remote.enabled:
+            if not self.remote.delete("transactions", f"id=eq.{transaction_id}"):
+                self.last_sync_error = self.remote.last_error
+                raise RuntimeError(self.remote.last_error or "No se pudo eliminar el movimiento remoto")
+        self.db.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+        self.db.commit()
+
+    def card_payment_candidates(self, account_id: str | None = None) -> list[dict[str, Any]]:
+        """Devuelve pagos pendientes y créditos históricos de tarjetas convertibles."""
+        query = (
+            "SELECT t.*, a.name AS account_name, a.institution, a.account_type "
+            "FROM transactions t JOIN accounts a ON a.id = t.account_id "
+            "WHERE a.account_type = 'tarjeta' AND t.amount < 0 "
+            "AND (t.transaction_type = ? OR t.transaction_type = 'income')"
+        )
+        params: list[Any] = [CARD_PAYMENT_PENDING]
+        if account_id:
+            query += " AND t.account_id = ?"
+            params.append(account_id)
+        query += " ORDER BY t.transaction_date DESC, t.created_at DESC"
+        rows = [dict(row) for row in self.db.execute(query, params).fetchall()]
+        return [row for row in rows if is_card_payment_description(row["description"])]
+
+    def convert_card_payment(self, transaction_id: str, source_account_id: str) -> dict[str, Any]:
+        """Convierte un crédito de tarjeta en una transferencia desde una cuenta bancaria."""
+        row = self.db.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
+        if not row:
+            raise ValueError("El movimiento no existe")
+        if self.account_type(row["account_id"]) != "tarjeta":
+            raise ValueError("El movimiento no pertenece a una tarjeta")
+        if row["amount"] >= 0 or not is_card_payment_description(row["description"]):
+            raise ValueError("El movimiento no parece ser un pago de tarjeta")
+        if self.account_type(source_account_id) != "cuenta":
+            raise ValueError("Selecciona una cuenta bancaria como origen")
+        if source_account_id == row["account_id"]:
+            raise ValueError("La cuenta de origen y la tarjeta deben ser diferentes")
+
+        existing = self._matching_card_payment_transfer(
+            source_account_id, abs(row["amount"]), row["transaction_date"], row["description"]
+        )
+        if existing and existing["id"] != transaction_id:
+            raise ValueError("Ya existe una transferencia para este pago")
+
+        matching_expense = self._matching_bank_expense(source_account_id, abs(row["amount"]), row["transaction_date"])
+        if matching_expense:
+            self._delete_transaction(matching_expense["id"])
+
+        data = {
+            "account_id": source_account_id,
+            "destination_account_id": row["account_id"],
+            "category_id": None,
+            "subcategory_id": None,
+            "amount": abs(float(row["amount"])),
+            "transaction_type": "transfer",
+            "id": transaction_id,
+        }
+        self.db.execute(
+            "UPDATE transactions SET account_id = :account_id, destination_account_id = :destination_account_id, "
+            "category_id = NULL, subcategory_id = NULL, amount = :amount, transaction_type = :transaction_type "
+            "WHERE id = :id",
+            data,
+        )
+        self.db.commit()
+        updated = dict(self.db.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone())
+        self._write_remote("transactions", updated)
+        return updated
 
     def guess_category_id(self, description: str) -> str | None:
         text = description.lower()
@@ -475,9 +591,15 @@ class DataStore:
                 category_id=row.get("category_id"), subcategory_id=row.get("subcategory_id"),
             )
         description = row["description"].strip()
-        category_id = row.get("category_id")
+        if transaction_type == "expense" and self.account_type(row["account_id"]) == "cuenta":
+            if self._matching_card_payment_transfer(row["account_id"], row["amount"], row["transaction_date"], description):
+                return False
+        is_pending_payment = transaction_type == CARD_PAYMENT_PENDING
+        category_id = None if is_pending_payment else row.get("category_id")
         subcategory_id = row.get("subcategory_id") or None
-        if not category_id and not subcategory_id:
+        if is_pending_payment:
+            subcategory_id = None
+        elif not category_id and not subcategory_id:
             suggestion = self.suggest_classification(description)
             if suggestion:
                 category_id = suggestion["category_id"]
